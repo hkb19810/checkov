@@ -29,6 +29,11 @@ def is_terraform_variable_dependent(value: Any) -> bool:
     if value.startswith(TF_BLOCK_REFS):
         return True
 
+    # Logical expressions may put an operator before the variable reference.
+    unquoted = re.sub(r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*' ''', "", value, flags=re.X)
+    if re.search(r"(?:^|[\s(!&|?:=<>])(?:var|local|module|data|each|count)\.", unquoted):
+        return True
+
     if value.startswith(TF_PROVIDER_PREFIXES):
         return True
 

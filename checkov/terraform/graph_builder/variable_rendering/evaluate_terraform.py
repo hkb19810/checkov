@@ -11,6 +11,10 @@ from checkov.common.util.type_forcers import force_int
 from checkov.common.util.parser_utils import find_var_blocks
 import checkov.terraform.graph_builder.variable_rendering.renderer as renderer
 from checkov.terraform.graph_builder.variable_rendering.safe_eval_functions import evaluate
+from checkov.terraform.graph_builder.variable_rendering.boolean_expressions import (
+    evaluate_boolean_container,
+    evaluate_boolean_expression,
+)
 
 T = TypeVar("T", str, int, bool)
 
@@ -58,6 +62,9 @@ def evaluate_terraform(input_str: Any, keep_interpolations: bool = True) -> Any:
     evaluated_value = strip_double_quotes(evaluated_value)
     evaluated_value = evaluate_directives(evaluated_value)
     evaluated_value = strip_interpolation_marks(evaluated_value)
+    handled, logical_value = evaluate_boolean_expression(evaluated_value, evaluate_terraform)
+    if handled:
+        return logical_value
     evaluated_value = evaluate_conditional_expression(evaluated_value)
     evaluated_value = evaluate_compare(evaluated_value)
     evaluated_value = evaluate_json_types(evaluated_value)
@@ -65,6 +72,8 @@ def evaluate_terraform(input_str: Any, keep_interpolations: bool = True) -> Any:
     second_evaluated_value = None
     if isinstance(evaluated_value, str):
         second_evaluated_value = _try_evaluate(evaluated_value)
+    else:
+        second_evaluated_value = evaluated_value
 
     if second_evaluated_value and callable(second_evaluated_value):
         return evaluated_value
@@ -132,7 +141,13 @@ def replace_string_value(original_str: Any, str_to_replace: str, replaced_value:
         wrapped_str_to_replace = f'"{str_to_replace}"'
         if wrapped_str_to_replace in string_without_interpolation:
             str_to_replace = wrapped_str_to_replace
-    res = string_without_interpolation.replace(str_to_replace, str(replaced_value))
+    replacement = str(replaced_value)
+    if isinstance(replaced_value, str):
+        logical, _ = evaluate_boolean_expression(replaced_value, evaluate_terraform)
+        if logical:
+            # Substituting !var.x with !(a || b) must retain precedence.
+            replacement = f"({replaced_value})"
+    res = string_without_interpolation.replace(str_to_replace, replacement)
     return res
 
 

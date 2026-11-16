@@ -279,6 +279,16 @@ class TerraformVariableRenderer(VariableRenderer["TerraformLocalGraph"]):
         evaluated_attribute_value = (
             str_to_evaluate if self.attributes_no_eval(changed_attribute_key, vertex) else evaluator.evaluate_terraform(str_to_evaluate)
         )
+        if not self.attributes_no_eval(changed_attribute_key, vertex) and isinstance(
+            changed_attribute_value, (list, dict)
+        ):
+            # Keep logical module inputs structured while their references are
+            # unresolved. Do not coerce literal strings elsewhere in a container.
+            handled, logical_value = evaluator.evaluate_boolean_container(
+                changed_attribute_value, evaluator.evaluate_terraform
+            )
+            if handled:
+                evaluated_attribute_value = logical_value
         self.local_graph.update_vertex_attribute(
             vertex, changed_attribute_key, evaluated_attribute_value, change_origin_id, attribute_at_dest
         )

@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 from checkov.common.util.type_forcers import force_int
 from checkov.common.graph.graph_builder.graph_components.attribute_names import CustomAttributes
 from checkov.terraform.graph_builder.graph_components.block_types import BlockType
+from checkov.terraform.graph_builder.variable_rendering.boolean_expressions import reference_words
 from checkov.terraform.graph_builder.variable_rendering.vertex_reference import TerraformVertexReference
 
 MODULE_DEPENDENCY_PATTERN_IN_PATH = re.compile(r"\(\[\{.+\#\*\#.+\}\]\)")
@@ -73,7 +74,7 @@ def get_vertices_references(
 ) -> List[TerraformVertexReference]:
     has_interpolation = True if "${" in str_value else False
     vertices_references: "list[TerraformVertexReference]" = []
-    words_in_str_value = str_value.split()
+    words_in_str_value = reference_words(str_value)
 
     for word in words_in_str_value:
         if word.startswith((".", r"/.")):
@@ -107,6 +108,7 @@ def add_vertices_references_from_word(
     resources_types: list[str],
 ) -> None:
     for w in word.split(","):
+        w = w.lstrip("(!").rstrip(")")
         word_sub_parts = w.split(".")
         if len(word_sub_parts) <= 1 or word_sub_parts[0].isnumeric():
             # if the word doesn't contain a '.' char, or if the first part before the dot is a number
@@ -233,6 +235,8 @@ def get_referenced_vertices_in_value(
             )
 
     if isinstance(value, str):
+        if len(value) >= 2 and value[0] in ('"', "'") and value[-1] == value[0] and '${' not in value:
+            return references_vertices
         references_vertices = get_referenced_vertices_in_str_value(
             str_value=value,
             aliases=aliases,
