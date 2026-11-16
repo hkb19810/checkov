@@ -102,6 +102,36 @@ def graph_nodes(graph: Any) -> dict[Any, dict[str, Any]]:
     return dict(graph.nodes(data=True))
 
 
+def _unbound_selector(node: Mapping[str, Any], nodes: Mapping[Any, Mapping[str, Any]]) -> bool:
+    """Do not interpret a missing input rendered as an empty collection as zero.
+
+    Follow the selector's retained provenance, including local/module inputs.
+    Only callers considering an empty result use this guard: unknown map VALUES
+    must not invalidate a nonempty map with known instance keys.
+    """
+    pending = [(node, key) for key in ('count', 'for_each') if key in node]
+    visited: set[tuple[int, str]] = set()
+    while pending:
+        owner, attribute = pending.pop()
+        identity = (id(owner), attribute)
+        if identity in visited:
+            continue
+        visited.add(identity)
+        for crumb in owner.get(A.RENDERING_BREADCRUMBS, {}).get(attribute, []):
+            kind = crumb.get('type')
+            if kind not in ('variable', 'locals'):
+                continue
+            matches = [item for item in nodes.values() if item.get(A.BLOCK_TYPE) == kind
+                       and item.get(A.BLOCK_NAME) == crumb.get('name')
+                       and str(item.get(A.FILE_PATH, '')).replace('\\', '/') == str(crumb.get('path', '')).replace('\\', '/')]
+            for item in matches:
+                key = 'default' if kind == 'variable' else crumb['name']
+                if key not in item:
+                    return True
+                pending.append((item, key))
+    return False
+
+
 def node_existence(node: Mapping[str, Any], nodes: Mapping[Any, Mapping[str, Any]], *,
                    value_resolver: Any = None) -> bool | None:
     """Inspect a graph vertex and its enclosing module instances.
@@ -120,7 +150,10 @@ def node_existence(node: Mapping[str, Any], nodes: Mapping[Any, Mapping[str, Any
         visited.add(id(pending))
         status = value_resolver(pending) if value_resolver else multiplicity(pending, wrapped=False)
         if status is False:
-            return False
+            if _unbound_selector(pending, nodes):
+                status = None
+            else:
+                return False
         if status is not True:
             uncertain = True
         try:
@@ -162,8 +195,6 @@ def resource_existence(conf: Mapping[str, Any], graph: Any = None,
     vertices, suppress other checks, or assert anything about deployed state.
     """
     own = multiplicity(conf)
-    if own is False:
-        return False
     nodes = graph_nodes(graph)
     if not nodes:
         return own

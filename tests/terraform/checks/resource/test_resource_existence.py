@@ -50,5 +50,25 @@ class TestExistence(unittest.TestCase):
         self.assertEqual(check.scan_entity_conf({'count':[0]}, 'aws_ebs_volume'), CheckResult.UNKNOWN)
         self.assertEqual(check.scan_entity_conf({'count':[1]}, 'aws_ebs_volume'), CheckResult.FAILED)
 
+    def test_unbound_map_is_not_proof_of_zero_instances(self):
+        variable = {h.A.BLOCK_TYPE: 'variable', h.A.BLOCK_NAME: 'items', h.A.FILE_PATH: 'main.tf'}
+        node = {h.A.BLOCK_TYPE: 'resource', h.A.RESOURCE_TYPE: 'aws_instance',
+                h.A.TF_RESOURCE_ADDRESS: 'aws_instance.main', 'for_each': {},
+                h.A.RENDERING_BREADCRUMBS: {'for_each': [
+                    {'type': 'variable', 'name': 'items', 'path': 'main.tf'}]}}
+        nodes = {1: node, 2: variable}
+        class Graph:
+            def nodes(self, data=False):
+                return list(nodes.items())
+        conf = {h.A.TF_RESOURCE_ADDRESS: 'aws_instance.main', 'for_each': [{}]}
+        self.assertIsNone(h.resource_existence(conf, Graph(), 'aws_instance'))
+        self.assertIsNone(h.node_existence(node, nodes))
+        variable['default'] = {}
+        self.assertIs(h.resource_existence(conf, Graph(), 'aws_instance'), False)
+        del variable['default']
+        node['for_each'] = {'known_key': None}
+        conf['for_each'] = [{'known_key': None}]
+        self.assertIs(h.resource_existence(conf, Graph(), 'aws_instance'), True)
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
