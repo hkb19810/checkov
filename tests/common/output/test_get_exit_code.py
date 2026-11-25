@@ -27,6 +27,24 @@ CRITICAL = Severities[BcSeverities.CRITICAL]
 
 class TestGetExitCode(unittest.TestCase):
 
+    def test_incomplete_helm_scan_exit_code(self):
+        report = Report(CheckType.HELM)
+        report.add_parsing_error('myapp/Chart.yaml: incomplete render')
+        thresholds = {'soft_fail': False, 'soft_fail_checks': [], 'soft_fail_threshold': None,
+                      'hard_fail_checks': [], 'hard_fail_threshold': None}
+
+        with mock.patch.dict(os.environ):
+            os.environ.pop(PARSE_ERROR_FAIL_FLAG, None)
+            self.assertEqual(report.get_exit_code(thresholds), 1)
+            self.assertEqual(report.get_exit_code(dict(thresholds, soft_fail=True)), 0)
+            other_report = Report(CheckType.TERRAFORM)
+            other_report.add_parsing_error('main.tf')
+            self.assertEqual(other_report.get_exit_code(thresholds), 0)
+            os.environ[PARSE_ERROR_FAIL_FLAG] = 'false'
+            self.assertEqual(report.get_exit_code(thresholds), 0)
+            os.environ[PARSE_ERROR_FAIL_FLAG] = 'true'
+            self.assertEqual(report.get_exit_code(dict(thresholds, soft_fail=True)), 1)
+
     def test_sca_get_exit_code(self):
         report = Report('sca_package')
         report.add_record(Record(

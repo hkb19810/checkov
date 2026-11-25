@@ -1,4 +1,7 @@
+import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -62,29 +65,21 @@ class TestRunnerValid(unittest.TestCase):
         self.assertEqual(len(report.parsing_errors), 0)
 
     @unittest.skipIf(not helm_exists(), "helm not installed")
-    def test_runner_invalid_chart(self):
-        current_dir = os.path.dirname(os.path.realpath(__file__))
-        scan_dir_path = os.path.join(current_dir, "runner", "resources", "schema-registry")
+    def test_scan_vendored_chart_with_helm_warnings(self):
+        chart_dir = Path(__file__).parent / 'runner/resources/schema-registry'
+        report = Runner().run(str(chart_dir), runner_filter=RunnerFilter(framework=['helm']))
 
-        runner = Runner()
-        filter = RunnerFilter(framework=['helm'], use_enforcement_rules=False)
-        # this is not quite a true test, because the checks don't have severities. However, this shows that the check registry
-        # passes the report type properly to RunnerFilter.should_run_check, and we have tests for that method
-        report = runner.run(
-            root_folder=scan_dir_path, runner_filter=filter
-        )
-
-        self.assertEqual(len(report.failed_checks), 0)
+        self.assertTrue(report.resources)
+        self.assertEqual(report.parsing_errors, [])
 
     @unittest.skipIf(not helm_exists(), "helm not installed")
     def test_get_binary_output_from_directory_equals_to_get_binary_result(self):
         current_dir = os.path.dirname(os.path.realpath(__file__))
-        scan_dir_path = os.path.join(current_dir, "runner", "resources", "schema-registry")
+        scan_dir_path = os.path.join(current_dir, "runner", "resources", "image_referencer")
 
         runner_filter = RunnerFilter(framework=['helm'], use_enforcement_rules=False)
 
-        chart_meta = Runner.parse_helm_chart_details(scan_dir_path)
-        chart_item = (scan_dir_path, chart_meta)
+        chart_item = Runner.parse_helm_chart_details(scan_dir_path)
         regular_result = Runner.get_binary_output(chart_item, target_dir='./tmp', helm_command="helm",
                                                   runner_filter=runner_filter)
         result_from_directory = Runner.get_binary_output_from_directory(str(scan_dir_path),
@@ -379,62 +374,138 @@ class TestHelmDependencyRemoteRepos(unittest.TestCase):
     # get_binary_output() integration tests
     # ------------------------------------------------------------------
 
-    def test_dependency_update_in_args_by_default(self):
-        """Default (no env var): --dependency-update is in helm args (original behaviour)."""
+    @mock.patch.dict(os.environ, {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": ""})
+    def test_successful_stdout_is_used_even_with_oci_progress_on_stderr(self):
         chart_item = self._make_chart_item()
-        fake_output = b"apiVersion: v1\nkind: ConfigMap\n"
-        mock_proc = mock.MagicMock()
-        mock_proc.communicate.return_value = (fake_output, b"")
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("CHECKOV_HELM_ALLOWED_REMOTE_REPOS", None)
-            with mock.patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
-                Runner.get_binary_output(chart_item, "./tmp", "helm", RunnerFilter())
-        call_args = mock_popen.call_args[0][0]
-        self.assertIn("--dependency-update", call_args)
+        output = b"---\n# Source: example/templates/pod.yaml\nkind: Pod\n"
+        completed = subprocess.CompletedProcess([], 0, output, b"Pulled: registry/chart:1.0.0\nDigest: sha256:abc\n")
+        with mock.patch("subprocess.run", return_value=completed) as run:
+            result, _ = Runner.get_binary_output(chart_item, "./tmp", "helm", RunnerFilter())
 
-    def test_build_skipped_when_repo_not_in_allowlist(self):
-        """When CHECKOV_HELM_ALLOWED_REMOTE_REPOS is set and a repo is not in it, build is skipped."""
+        self.assertEqual(result, output)
+        self.assertEqual(run.call_args.args[0], ["helm", "template", "--dependency-update", self._REMOTE_DEP_DIR])
+
+    @mock.patch.dict(os.environ, {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": ""})
+    def test_nonzero_helm_exit_discards_stdout_even_without_stderr(self):
         chart_item = self._make_chart_item()
-        # The first subprocess.Popen call is 'helm dependency list' (before the allowlist check).
-        # We must mock it so it does not crash; the allowlist check then returns None before the second call.
-        dep_list_proc = mock.MagicMock()
-        dep_list_proc.communicate.return_value = (b"", b"")
-        env = {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": "https://charts.trusted.org/"}
-        with mock.patch.dict(os.environ, env):
-            with mock.patch("subprocess.Popen", return_value=dep_list_proc) as mock_popen:
-                result, _ = Runner.get_binary_output(chart_item, "./tmp", "helm", RunnerFilter())
+        completed = subprocess.CompletedProcess([], 1, b"partial YAML output", b"")
+        with mock.patch("subprocess.run", return_value=completed):
+            result, _ = Runner.get_binary_output(chart_item, "./tmp", "helm", RunnerFilter())
+
         self.assertIsNone(result)
-        # Only the dependency list call should have been made; helm template must NOT be called.
-        self.assertEqual(mock_popen.call_count, 1)
-        self.assertIn("dependency", mock_popen.call_args[0][0])
 
+    @mock.patch.dict(os.environ, {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": "https://charts.trusted.org/"})
+    def test_build_skipped_when_repo_not_in_allowlist(self):
+        with mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as run:
+            result, _ = Runner.get_binary_output(self._make_chart_item(), "./tmp", "helm", RunnerFilter())
+
+        self.assertIsNone(result)
+        self.assertFalse(any(call.args[0][1] == "template" for call in run.call_args_list))
+
+    @mock.patch.dict(os.environ, {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": "http://192.0.2.1"})
     def test_build_proceeds_when_all_repos_in_allowlist(self):
-        """When all repos are in the allowlist, build proceeds normally."""
-        chart_item = self._make_chart_item()
-        fake_output = b"apiVersion: v1\nkind: ConfigMap\n"
-        dep_list_proc = mock.MagicMock()
-        dep_list_proc.communicate.return_value = (b"", b"")
-        template_proc = mock.MagicMock()
-        template_proc.communicate.return_value = (fake_output, b"")
-        env = {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": "http://192.0.2.1"}
-        with mock.patch.dict(os.environ, env):
-            with mock.patch("subprocess.Popen", side_effect=[dep_list_proc, template_proc]) as mock_popen:
-                result, _ = Runner.get_binary_output(chart_item, "./tmp", "helm", RunnerFilter())
-        self.assertEqual(mock_popen.call_count, 2)
-        self.assertEqual(result, fake_output)
+        output = b"apiVersion: v1\nkind: ConfigMap\n"
+        with mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, output, b"")):
+            result, _ = Runner.get_binary_output(self._make_chart_item(), "./tmp", "helm", RunnerFilter())
+        self.assertEqual(result, output)
 
-    def test_chart_dir_always_last_arg(self):
-        """chart_dir must always be the last argument."""
-        chart_item = self._make_chart_item()
-        fake_output = b"apiVersion: v1\nkind: ConfigMap\n"
-        mock_proc = mock.MagicMock()
-        mock_proc.communicate.return_value = (fake_output, b"")
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("CHECKOV_HELM_ALLOWED_REMOTE_REPOS", None)
-            with mock.patch("subprocess.Popen", return_value=mock_proc) as mock_popen:
-                Runner.get_binary_output(chart_item, "./tmp", "helm", RunnerFilter())
-        call_args = mock_popen.call_args[0][0]
-        self.assertEqual(call_args[-1], self._REMOTE_DEP_DIR)
+
+@unittest.skipIf(not helm_exists(), "helm not installed")
+class TestIncompleteHelmChart(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.parent = self.root / "parent"
+        self.parent.mkdir()
+        self.chart_yaml = self.parent / "Chart.yaml"
+        self.chart_yaml.write_text(
+            "apiVersion: v2\nname: parent\nversion: 1.0.0\ndependencies:\n"
+            "- name: unavailable\n  version: 1.0.0\n  repository: file://../unavailable\n"
+        )
+
+    def test_cli_exits_nonzero_when_chart_has_no_scannable_resources(self):
+        project = Path(__file__).resolve().parents[2]
+        config = self.root / "config.yaml"
+        config.write_text("{}\n")
+        env = dict(os.environ, PYTHONPATH=str(project), BC_SKIP_MAPPING="true",
+                   CHECKOV_HELM_ALLOWED_REMOTE_REPOS="")
+        env.pop("CKV_PARSE_ERROR_FAIL", None)
+        result = subprocess.run(
+            [sys.executable, str(project / "bin/checkov"), "-d", str(self.parent), "--framework", "helm",
+             "--config-file", str(config), "--skip-download", "--quiet", "-o", "json"],
+            cwd=self.root, env=env, capture_output=True, text=True, timeout=90, check=False,
+        )
+
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["summary"]["failed"], 0)
+        self.assertGreater(report["summary"]["parsing_errors"], 0)
+        self.assertIn("Chart.yaml", report["results"]["parsing_errors"][0])
+
+    @mock.patch.dict(os.environ, {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": "none"})
+    def test_blocked_dependency_is_reported_without_rendering_or_partial_recovery(self):
+        metadata = self.chart_yaml.read_text().replace("file://../unavailable", "https://charts.example.com")
+        self.chart_yaml.write_text(metadata)
+        with mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as run:
+            report = Runner().run(str(self.parent), runner_filter=RunnerFilter(framework=["helm"]))
+
+        self.assertTrue(any("allowlist" in error for error in report.parsing_errors))
+        self.assertFalse(any(call.args[0][1] == "template" for call in run.call_args_list))
+
+    def test_missing_dependency_preserves_findings_from_packaged_sibling(self):
+        sibling = self.root / "available"
+        templates = sibling / "templates"
+        templates.mkdir(parents=True)
+        (sibling / "Chart.yaml").write_text("apiVersion: v2\nname: available\nversion: 1.0.0\n")
+        (sibling / "values.yaml").write_text("image: example:1.0.0\n")
+        (templates / "pod.yaml").write_text(
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: available-sibling\n"
+            "spec:\n  containers:\n    - name: app\n      image: {{ .Values.image | quote }}\n"
+        )
+        overrides = self.root / "overrides.yaml"
+        overrides.write_text("available:\n  image: example:latest\n")
+        charts = self.parent / "charts"
+        charts.mkdir()
+        subprocess.run(["helm", "package", str(sibling), "--destination", str(charts)],
+                       check=True, capture_output=True, timeout=30)
+        chart_yaml = self.chart_yaml.read_text() + "- name: available\n  version: 1.0.0\n  repository: file://../available\n"
+        self.chart_yaml.write_text(chart_yaml)
+
+        runner_filter = RunnerFilter(framework=["helm"], checks=["CKV_K8S_14"], var_files=[str(overrides)])
+        report = Runner().run(str(self.parent), runner_filter=runner_filter)
+
+        self.assertTrue(any("unavailable" in error for error in report.parsing_errors))
+        findings = [record for record in report.failed_checks if "available-sibling" in record.resource]
+        self.assertEqual([record.check_id for record in findings], ["CKV_K8S_14"])
+        self.assertTrue(any("partial" in detail and "unavailable" in detail for detail in findings[0].details))
+        self.assertEqual(self.chart_yaml.read_text(), chart_yaml)
+
+    def test_retry_builds_missing_but_resolvable_sibling(self):
+        # Keep the dependency source outside Checkov's chart discovery so its
+        # finding can only come from rendering it in the parent release.
+        available = self.parent / ".sources" / "available"
+        available.mkdir(parents=True)
+        (available / "Chart.yaml").write_text("apiVersion: v2\nname: available\nversion: 1.0.0\n")
+        with self.chart_yaml.open("a") as f:
+            f.write("- name: available\n  version: 1.0.0\n  repository: file://.sources/available\n")
+        for directory in (self.parent, available):
+            templates = directory / "templates"
+            templates.mkdir()
+            (templates / "pod.yaml").write_text(
+                "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {{ .Chart.Name }}\n"
+                "spec:\n  containers:\n    - name: app\n      image: example:latest\n"
+            )
+        self.assertFalse((self.parent / "charts").exists())
+
+        report = Runner().run(str(self.parent), runner_filter=RunnerFilter(framework=["helm"], checks=["CKV_K8S_14"]))
+
+        self.assertEqual(len(report.parsing_errors), 1)
+        self.assertIn("unavailable", report.parsing_errors[0])
+        self.assertCountEqual([record.resource for record in report.failed_checks],
+                              ["Pod.default.parent", "Pod.default.available"])
+        for record in report.failed_checks:
+            self.assertTrue(any("partial" in detail and "unavailable" in detail for detail in record.details))
 
 
 class TestRenderedSourcePaths(unittest.TestCase):

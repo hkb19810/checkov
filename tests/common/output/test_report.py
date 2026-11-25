@@ -1,4 +1,15 @@
+from checkov.common.bridgecrew.check_type import CheckType
 from checkov.common.output.report import Report
+
+
+def test_quiet_helm_output_identifies_incomplete_chart():
+    report = Report(CheckType.HELM)
+    assert 'parsing_errors' not in report.get_dict(is_quiet=True)['results']
+    error = 'myapp/Chart.yaml: incomplete render'
+    report.add_parsing_error(error)
+    output = report.get_dict(is_quiet=True)
+    assert output['results']['parsing_errors'] == [error]
+    assert output['summary']['parsing_errors'] == 1
 
 
 def test_from_reduced_json(json_reduced_report):

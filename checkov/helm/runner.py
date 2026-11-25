@@ -8,7 +8,7 @@ import re
 import shutil
 import subprocess  # nosec
 import tempfile
-import threading
+from dataclasses import dataclass, field
 from typing import Any, Type, TYPE_CHECKING
 from urllib.parse import urlsplit
 import yaml
@@ -23,11 +23,11 @@ from checkov.common.parallelizer.parallel_runner import parallel_runner
 from checkov.common.runners.base_runner import BaseRunner, filter_ignored_paths
 from checkov.common.util.file_utils import _is_within
 from checkov.helm.image_referencer.manager import HelmImageReferencerManager
+from checkov.helm.partial_render import render_available_dependencies
 from checkov.helm.registry import registry
 from checkov.kubernetes.graph_builder.local_graph import KubernetesLocalGraph
-from checkov.kubernetes.runner import Runner as k8_runner, handle_timeout, _KubernetesContext, _KubernetesDefinitions
+from checkov.kubernetes.runner import Runner as k8_runner, _KubernetesContext, _KubernetesDefinitions
 from checkov.runner_filter import RunnerFilter
-import signal
 
 if TYPE_CHECKING:
     from checkov.kubernetes.graph_manager import KubernetesGraphManager
@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
 
 # Regex matching remote helm repository URLs (http/https).
-# OCI refs (oci://) use a separate pull mechanism and are not affected by --dependency-update.
+# OCI registries are not covered by this HTTP(S) repository allowlist.
 _HELM_REMOTE_REPO = re.compile(r'^https?://', re.IGNORECASE)
 
 
@@ -97,7 +97,7 @@ def _get_blocked_helm_repos(chart_dir: str) -> list[str]:
     """Return dependency repos blocked by the CHECKOV_HELM_ALLOWED_REMOTE_REPOS allowlist.
 
     Not set → [] (allow all). Set → returns repos not matching any allowed prefix (these are blocked).
-    To block all remote repos, set the var to a non-matching value (e.g. 'none').
+    To block all direct HTTP(S) repositories, use a non-matching value (e.g. 'none').
     """
     allowed_prefixes_raw = os.getenv("CHECKOV_HELM_ALLOWED_REMOTE_REPOS", "")
     if not allowed_prefixes_raw.strip():
@@ -108,6 +108,20 @@ def _get_blocked_helm_repos(chart_dir: str) -> list[str]:
         return []  # '*' → allow everything
     remote_repos = _get_chart_remote_repos(chart_dir)
     return [repo for repo in remote_repos if not any(_repo_matches_prefix(repo.lower(), p) for p in allowed_prefixes)]
+
+
+class HelmRenderError(Exception):
+    def __init__(self, message: str, diagnostic: str = "") -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
+
+@dataclass
+class _ChartConversion:
+    # Workers may run in separate processes, so return their data to the parent.
+    template_mapping: dict[str, str] = field(default_factory=dict)
+    rendered_files: set[str] = field(default_factory=set)
+    error: str | None = None
 
 
 class K8sHelmRunner(k8_runner):
@@ -124,6 +138,7 @@ class K8sHelmRunner(k8_runner):
         super().__init__(graph_class, db_connector, source, graph_manager, external_registries)
         self.chart_dir_and_meta: list[tuple[str, dict[str, Any]]] = []
         self.pbar.turn_off_progress_bar()
+        self.partial_files: dict[str, str] = {}
         self.original_root_dir = ''
         self.tmp_root_dir = ''
         self.template_mapping: dict[str, str] = {}
@@ -158,6 +173,11 @@ class K8sHelmRunner(k8_runner):
                 helm_report = chart_results
                 sca_image_report = None
 
+            for record in helm_report.get_all_records():
+                partial = self.partial_files.get(os.path.normpath(record.file_abs_path))
+                if partial:
+                    record.details.append(partial)
+
             if root_folder is not None:
                 fix_report_paths(report=helm_report, tmp_dir=root_folder, template_mapping=self.template_mapping, original_root_folder=self.original_root_dir)
                 if self.original_root_dir:
@@ -168,14 +188,7 @@ class K8sHelmRunner(k8_runner):
             return chart_results
         except Exception:
             logging.warning(f"Failed to run Kubernetes runner on charts {self.chart_dir_and_meta}", exc_info=True)
-            # with tempfile.TemporaryDirectory() as save_error_dir:
-            # TODO this will crash the run when target_dir gets cleaned up, since it no longer exists
-            # we either need to copy or find another way to extract whatever we want to get from this (the TODO below)
-            # logging.debug(
-            #    f"Error running k8s scan on {chart_meta['name']}. Scan dir: {target_dir}. Saved context dir: {save_error_dir}")
-            # shutil.move(target_dir, save_error_dir)
-
-            # TODO: Export helm dependencies for the chart we've extracted in chart_dependencies
+            report.add_parsing_error("Failed to scan rendered Helm manifests (see scanner log)")
             return report
 
     def get_image_report(self, root_folder: str | None, runner_filter: RunnerFilter) -> Report | None:
@@ -215,6 +228,8 @@ class Runner(BaseRunner[_KubernetesDefinitions, _KubernetesContext, "KubernetesG
         self.target_folder_path = ''
         self.root_folder = ''
         self.runner_filter: "RunnerFilter | None" = None
+        self.render_errors: list[str] = []
+        self.partial_files: dict[str, str] = {}
         self.template_mapping: dict[str, str] = {}
 
     def get_k8s_target_folder_path(self) -> str:
@@ -222,13 +237,13 @@ class Runner(BaseRunner[_KubernetesDefinitions, _KubernetesContext, "KubernetesG
 
     @staticmethod
     def parse_helm_chart_details(chart_path: str) -> tuple[str, dict[str, Any] | None]:
-        with open(f"{chart_path}/Chart.yaml", 'r') as chartyaml:
-            try:
-                chart_meta: dict[str, Any] = yaml.safe_load(chartyaml)
-            except (yaml.YAMLError, UnicodeDecodeError):
-                logging.info(f"Failed to load chart metadata from {chart_path}/Chart.yaml.", exc_info=True)
-                return chart_path, None
-        return chart_path, chart_meta
+        try:
+            with open(os.path.join(chart_path, "Chart.yaml"), encoding="utf-8") as chart_file:
+                chart_meta = yaml.safe_load(chart_file)
+        except (OSError, yaml.YAMLError, UnicodeDecodeError):
+            logging.warning("Failed to load chart metadata from %s/Chart.yaml", chart_path, exc_info=True)
+            return chart_path, None
+        return chart_path, chart_meta if isinstance(chart_meta, dict) else None
 
     def check_system_deps(self) -> str | None:
         # Ensure local system dependencies are available and of the correct version.
@@ -265,7 +280,8 @@ class Runner(BaseRunner[_KubernetesDefinitions, _KubernetesContext, "KubernetesG
         return bool(_is_within(target_dir, os.path.join(target_dir, source)))
 
     @staticmethod
-    def _parse_output(target_dir: str, output: bytes, chart_dir: str, template_mapping: dict[str, str]) -> None:
+    def _parse_output(target_dir: str, output: bytes, chart_dir: str, template_mapping: dict[str, str]) -> set[str]:
+        rendered_files: set[str] = set()
         output_str = str(output, 'utf-8')
         reader = io.StringIO(output_str)
         cur_source_file = None
@@ -283,7 +299,7 @@ class Runner(BaseRunner[_KubernetesDefinitions, _KubernetesContext, "KubernetesG
                 # So we will close the old file, open a new file, and write the dashes from last iteration plus this line
 
                 if not s.startswith('# Source: '):
-                    raise Exception(f'Line {line_num}: Expected line to start with # Source: {s}')
+                    raise ValueError(f'Line {line_num}: Expected line to start with # Source: {s}')
                 source = s[10:]
                 if not Runner._is_safe_source_path(target_dir, source):
                     # Drop this document - its content must not be written outside of the target dir
@@ -297,6 +313,7 @@ class Runner(BaseRunner[_KubernetesDefinitions, _KubernetesContext, "KubernetesG
                         if cur_writer:
                             cur_writer.close()
                         file_path = os.path.join(target_dir, source)
+                        rendered_files.add(os.path.normpath(file_path))
                         parent = os.path.dirname(file_path)
                         os.makedirs(parent, exist_ok=True)
                         cur_source_file = source
@@ -321,7 +338,7 @@ class Runner(BaseRunner[_KubernetesDefinitions, _KubernetesContext, "KubernetesG
                 last_line_dashes = False
             else:
                 if s.startswith('# Source: '):
-                    raise Exception(f'Line {line_num}: Unexpected line starting with # Source: {s}')
+                    raise ValueError(f'Line {line_num}: Unexpected line starting with # Source: {s}')
 
                 if not cur_writer:
                     continue
@@ -332,6 +349,7 @@ class Runner(BaseRunner[_KubernetesDefinitions, _KubernetesContext, "KubernetesG
 
         if cur_writer:
             cur_writer.close()
+        return rendered_files
 
     @staticmethod
     def _get_target_dir(chart_item: tuple[str, dict[str, Any]], root_folder: str, target_folder_path: str) -> str | None:
@@ -339,7 +357,7 @@ class Runner(BaseRunner[_KubernetesDefinitions, _KubernetesContext, "KubernetesG
         target_dir = chart_dir.replace(root_folder, f'{target_folder_path}/')
         target_dir.replace("//", "/")
         chart_name = chart_meta.get('name', chart_meta.get('Name'))
-        if not chart_name:
+        if not isinstance(chart_name, str) or not chart_name:
             logging.info(
                 f"Error parsing chart located {chart_dir}, chart has no name available",
                 exc_info=True,
@@ -363,79 +381,49 @@ class Runner(BaseRunner[_KubernetesDefinitions, _KubernetesContext, "KubernetesG
     def get_binary_output(
         chart_item: tuple[str, dict[str, Any]], target_dir: str, helm_command: str, runner_filter: RunnerFilter, timeout: int = 3600
     ) -> tuple[bytes, tuple[str, dict[str, Any]]] | tuple[None, None]:
-        (chart_dir, chart_meta) = chart_item
+        try:
+            return Runner._render_chart(chart_item, helm_command, runner_filter, timeout), chart_item
+        except HelmRenderError as exc:
+            logging.warning("Failed processing Helm chart %s: %s", chart_item[0], exc)
+            return None, None
+
+    @staticmethod
+    def _render_chart(
+        chart_item: tuple[str, dict[str, Any]], helm_command: str, runner_filter: RunnerFilter, timeout: int
+    ) -> bytes:
+        chart_dir, chart_meta = chart_item
         if not isinstance(chart_meta, dict):
-            logging.error(f"invalid chart meta {chart_meta}")
-            return None, None
-        chart_name = chart_meta.get('name', chart_meta.get('Name'))
-        chart_version = chart_meta.get('version', chart_meta.get('Version'))
-        logging.info(
-            f"Processing chart found at: {chart_dir}, name: {chart_name}, version: {chart_version}")
-        # dependency list is nicer to parse than dependency update.
+            raise HelmRenderError("invalid chart metadata")
+        logging.info("Processing Helm chart %s", chart_dir)
         try:
-            helm_binary_list_chart_deps = subprocess.Popen([helm_command, 'dependency', 'list', chart_dir], stdout=subprocess.PIPE, stderr=subprocess.PIPE)  # nosec
-            o, e = helm_binary_list_chart_deps.communicate()
-        except Exception:
-            logging.error('Error run helm command', exc_info=True)
-            return None, None
-        logging.debug(
-            f"Ran helm command to get dependency output. Chart: {chart_name}. dir: {target_dir}. Output: {str(o, 'utf-8')}. Errors: {str(e, 'utf-8')}")
-        if e:
-            if "Warning: Dependencies" in str(e, 'utf-8'):
-                logging.warning(
-                    f"V1 API chart without Chart.yaml dependencies. Skipping chart dependancy list for {chart_name} at dir: {chart_dir}. Working dir: {target_dir}. Error details: {str(e, 'utf-8')}")
-            else:
-                logging.warning(
-                    f"Error processing helm dependencies for {chart_name} at source dir: {chart_dir}. Working dir: {target_dir}. Error details: {str(e, 'utf-8')}")
+            deps = subprocess.run([helm_command, 'dependency', 'list', chart_dir],  # nosec
+                                  capture_output=True, timeout=timeout, check=False)
+            logging.debug("Helm dependency list for %s: %s", chart_dir, deps.stdout.decode(errors='replace'))
+            if deps.stderr:
+                logging.warning("Helm dependency list for %s: %s", chart_dir, deps.stderr.decode(errors='replace').strip())
 
-        # Default = allow all. Set CHECKOV_HELM_ALLOWED_REMOTE_REPOS
-        # to a comma-separated allowlist of trusted repo URL prefixes to block everything else.
-        blocked_repos = _get_blocked_helm_repos(chart_dir)
-        if blocked_repos:
-            logging.warning(
-                f"Skipping helm template for {chart_dir}: {len(blocked_repos)} dependency repo(s) "
-                f"not in CHECKOV_HELM_ALLOWED_REMOTE_REPOS allowlist."
-            )
-            return None, None
+            blocked_repos = _get_blocked_helm_repos(chart_dir)
+            if blocked_repos:
+                raise HelmRenderError(f"{len(blocked_repos)} dependency repo(s) not in CHECKOV_HELM_ALLOWED_REMOTE_REPOS allowlist")
 
-        helm_command_args = [helm_command, 'template', '--dependency-update', chart_dir]
-        if runner_filter.var_files:
-            for var in runner_filter.var_files:
-                helm_command_args.append("--values")
-                helm_command_args.append(var)
+            args = [helm_command, 'template', '--dependency-update', chart_dir]
+            for var_file in runner_filter.var_files or []:
+                args.extend(['--values', var_file])
+            result = subprocess.run(args, capture_output=True, timeout=timeout, check=False)  # nosec
+        except subprocess.TimeoutExpired as exc:
+            raise HelmRenderError(f"Helm timed out after {timeout} seconds") from exc
+        except OSError as exc:
+            raise HelmRenderError(f"could not run Helm: {exc}") from exc
 
-        if threading.current_thread() is threading.main_thread():
-            signal.signal(signal.SIGALRM, handle_timeout)
-            signal.alarm(timeout)
-
-        try:
-            # --dependency-update needed to pull in deps before templating.
-            proc = subprocess.Popen(helm_command_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)  # nosec
-            o, e = proc.communicate()
-            if threading.current_thread() is threading.main_thread():
-                signal.alarm(0)
-            if e:
-                logging.warning(
-                    f"Failed processing helm chart {chart_name} at dir: {chart_dir}. Working dir: {target_dir}. Failure details: {str(e, 'utf-8')}")
-                return None, None
-            logging.debug(
-                f"Ran helm command to template chart output. Chart: {chart_name}. dir: {target_dir}. Output: {str(o, 'utf-8')}. Errors: {str(e, 'utf-8')}")
-            logging.info(f'Done helm run for: {chart_dir}')
-            return o, chart_item
-
-        except Exception as e:
-            if threading.current_thread() is threading.main_thread():
-                signal.alarm(0)
-            if isinstance(e, TimeoutError):
-                logging.info(
-                    f"Error processing helm chart {chart_name} at dir: {chart_dir}. Working dir: {target_dir}. got timeout"
-                )
-            else:
-                logging.info(
-                    f"Error processing helm chart {chart_name} at dir: {chart_dir}. Working dir: {target_dir}.",
-                    exc_info=True,
-                )
-            return None, None
+        diagnostic = result.stderr.decode(errors='replace').strip()
+        if diagnostic:
+            logging.warning("Helm template for %s: %s", chart_dir, diagnostic)
+        if result.returncode:
+            message = f"helm template exited {result.returncode}"
+            if "could not download" in diagnostic and "401" in diagnostic:
+                message += " (dependency download returned HTTP 401 Unauthorized)"
+            raise HelmRenderError(message, diagnostic)
+        return result.stdout
 
     @staticmethod
     def _convert_chart_to_k8s(
@@ -444,37 +432,38 @@ class Runner(BaseRunner[_KubernetesDefinitions, _KubernetesContext, "KubernetesG
         target_folder_path: str,
         helm_command: str,
         runner_filter: RunnerFilter,
-        template_mapping: dict[str, str]
-    ) -> None:
+    ) -> _ChartConversion:
+        result = _ChartConversion()
+        chart_dir, _ = chart_item
+        chart_path = os.path.join(chart_dir, "Chart.yaml")
         target_dir = Runner._get_target_dir(chart_item, root_folder, target_folder_path)
         if not target_dir:
-            return
-
-        o, _ = Runner.get_binary_output(chart_item, target_folder_path, helm_command, runner_filter)
-        if o is None:
-            return
+            result.error = f"{chart_path}: invalid chart metadata or missing chart name"
+            return result
 
         try:
-            # chart_dir is the directory containing the Chart.yaml file
-            chart_dir = chart_item[0]  # This is the full path to the chart directory
-            Runner._parse_output(target_dir, o, chart_dir, template_mapping)
-        except Exception:
-            (chart_dir, chart_meta) = chart_item
-            chart_name = chart_meta.get('name', chart_meta.get('Name'))
-            logging.info(
-                f"Error parsing output {chart_name} at dir: {chart_dir}. Working dir: {target_dir}.",
-                exc_info=True,
-            )
+            output = Runner._render_chart(chart_item, helm_command, runner_filter, timeout=3600)
+        except HelmRenderError as exc:
+            result.error = f"{chart_path}: {exc}"
+            recovered = None
+            if exc.diagnostic:
+                recovered = render_available_dependencies(
+                    chart_dir, helm_command, runner_filter.var_files or [], 3600, exc.diagnostic,
+                    blocked_repos=_get_blocked_helm_repos,
+                )
+            if recovered is None:
+                logging.warning("Incomplete Helm scan for %s", result.error)
+                return result
+            output, omitted = recovered
+            result.error += f" (partial render, omitted dependencies: {', '.join(omitted)})"
+            logging.warning("Incomplete Helm scan for %s", result.error)
 
-    @staticmethod
-    def _get_chart_dir_and_meta(
-        root_folder: str | None, files: list[str] | None, runner_filter: RunnerFilter
-    ) -> list[tuple[str, dict[str, Any]]]:
-        chart_directories = find_chart_directories(root_folder, files, runner_filter.excluded_paths)
-        chart_dir_and_meta = parallel_runner.run_function(func=Runner.parse_helm_chart_details, items=chart_directories)
-        # remove parsing failures
-        cleaned_chart_dir_and_meta = [(chart_dir, meta) for chart_dir, meta in chart_dir_and_meta if meta]
-        return cleaned_chart_dir_and_meta
+        try:
+            result.rendered_files = Runner._parse_output(target_dir, output, chart_dir, result.template_mapping)
+        except (OSError, ValueError, RuntimeError) as exc:
+            logging.warning("Error parsing rendered output for %s", chart_dir, exc_info=True)
+            result.error = f"{result.error or chart_path}: failed to read rendered manifests ({type(exc).__name__})"
+        return result
 
     @staticmethod
     def _get_processed_chart_dir_and_meta(
@@ -491,13 +480,20 @@ class Runner(BaseRunner[_KubernetesDefinitions, _KubernetesContext, "KubernetesG
         self.root_folder = root_folder or ""
         self.runner_filter = runner_filter
         self.target_folder_path = tempfile.mkdtemp()
-        chart_dir_and_meta = Runner._get_chart_dir_and_meta(self.root_folder, files, runner_filter)
-        chart_items = [
-            (chart_item, self.root_folder, self.target_folder_path, self.helm_command, runner_filter, self.template_mapping)
-            for chart_item in chart_dir_and_meta
-        ]
-
-        list(parallel_runner.run_function(func=Runner._convert_chart_to_k8s, items=chart_items))
+        self.render_errors = []
+        self.template_mapping = {}
+        self.partial_files = {}
+        chart_dirs = find_chart_directories(root_folder, files, runner_filter.excluded_paths)
+        metadata = parallel_runner.run_function(func=Runner.parse_helm_chart_details, items=chart_dirs)
+        chart_dir_and_meta = [(directory, meta or {}) for directory, meta in metadata]
+        chart_items = [(item, self.root_folder, self.target_folder_path, self.helm_command, runner_filter)
+                       for item in chart_dir_and_meta]
+        for conversion in parallel_runner.run_function(func=Runner._convert_chart_to_k8s, items=chart_items):
+            self.template_mapping.update(conversion.template_mapping)
+            if conversion.error:
+                self.render_errors.append(conversion.error)
+                self.partial_files.update(dict.fromkeys(conversion.rendered_files, conversion.error))
+        self.render_errors.sort()
         return Runner._get_processed_chart_dir_and_meta(chart_dir_and_meta, self.root_folder)
 
     def remove_target_folder(self) -> None:
@@ -519,14 +515,19 @@ class Runner(BaseRunner[_KubernetesDefinitions, _KubernetesContext, "KubernetesG
             self.pbar.turn_off_progress_bar()
 
         k8s_runner = K8sHelmRunner()
-        k8s_runner.chart_dir_and_meta = self.convert_helm_to_k8s(root_folder, files, runner_filter)
-        k8s_runner.template_mapping = self.template_mapping
-        k8s_runner.original_root_dir = str(root_folder)
-        k8s_runner.tmp_root_dir = self.get_k8s_target_folder_path()
-        report = k8s_runner.run(self.get_k8s_target_folder_path(), external_checks_dir=external_checks_dir, runner_filter=runner_filter)
-        self.graph_manager = k8s_runner.graph_manager
-        self.remove_target_folder()
-        return report
+        try:
+            k8s_runner.chart_dir_and_meta = self.convert_helm_to_k8s(root_folder, files, runner_filter)
+            k8s_runner.template_mapping = self.template_mapping
+            k8s_runner.partial_files = self.partial_files
+            k8s_runner.original_root_dir = str(root_folder)
+            k8s_runner.tmp_root_dir = self.get_k8s_target_folder_path()
+            report = k8s_runner.run(k8s_runner.tmp_root_dir, external_checks_dir=external_checks_dir, runner_filter=runner_filter)
+            helm_report = next(r for r in report if r.check_type == self.check_type) if isinstance(report, list) else report
+            helm_report.add_parsing_errors(self.render_errors)
+            self.graph_manager = k8s_runner.graph_manager
+            return report
+        finally:
+            self.remove_target_folder()
 
 
 def fix_report_paths(report: Report, tmp_dir: str, template_mapping: dict[str, str], original_root_folder: str) -> None:

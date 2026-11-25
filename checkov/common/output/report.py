@@ -105,11 +105,12 @@ class Report:
             url = S3_UPLOAD_DETAILS_MESSAGE
 
         if is_quiet:
+            quiet_results: dict[str, Any] = {"failed_checks": [check.__dict__ for check in self.failed_checks]}
+            if self.check_type == CheckType.HELM and self.parsing_errors:
+                quiet_results["parsing_errors"] = list(self.parsing_errors)
             return {
                 "check_type": self.check_type,
-                "results": {
-                    "failed_checks": [check.__dict__ for check in self.failed_checks]
-                },
+                "results": quiet_results,
                 "summary": self.get_summary(),
             }
         if full_report:
@@ -147,7 +148,11 @@ class Report:
         :return: Exit code 0 or 1.
         """
 
-        hard_fail_on_parsing_errors = os.getenv(PARSE_ERROR_FAIL_FLAG, "false").lower() == 'true'
+        # An incomplete Helm render can omit every resource in an otherwise valid chart.
+        fail_by_default = (
+            self.check_type == CheckType.HELM and not cast(_ExitCodeThresholds, exit_code_thresholds)['soft_fail']
+        )
+        hard_fail_on_parsing_errors = os.getenv(PARSE_ERROR_FAIL_FLAG, str(fail_by_default)).lower() == 'true'
         logging.debug(f'In get_exit_code; exit code thresholds: {exit_code_thresholds}, hard_fail_on_parsing_errors: {hard_fail_on_parsing_errors}')
 
         if self.parsing_errors and hard_fail_on_parsing_errors:
