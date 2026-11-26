@@ -18,8 +18,10 @@ def _dependency_error(diagnostic: str) -> str:
     # Helm can emit warnings before its final error. A template author's own
     # error message (from the Helm "fail" function) can contain newlines too.
     error = next((s for s in diagnostic.splitlines() if s.startswith('Error: ')), '')
-    if (error.startswith(('Error: could not download ', "Error: can't get a valid version for ",
-                          'Error: found in Chart.yaml, but missing in charts/ directory:'))
+    # Without --dependency-update Helm prefixes the missing-dependency message with
+    # "an error occurred while checking for chart dependencies ...".
+    if (error.startswith(('Error: could not download ', "Error: can't get a valid version for "))
+            or 'found in Chart.yaml, but missing in charts/ directory:' in error
             or re.fullmatch(r'Error: directory .+ not found', error)):
         return error
     return ''
@@ -71,13 +73,14 @@ def _can_update(deps: list[dict[str, Any]], lock: Any, stage: Path) -> bool:
 
 def render_available_dependencies(
     chart_dir: str, helm_command: str, var_files: Sequence[str], timeout: int, diagnostic: str,
-    blocked_repos: Callable[[str], list[str]],
+    blocked_repos: Callable[[str], list[str]], allow_downloads: bool = False,
 ) -> tuple[bytes, list[str]] | None:
     """Best-effort render of a v2 parent. The caller must always retain the original error.
 
     Only omit direct charts that Helm reports missing. Retained chart declarations
     keep their parent context, including conditions, aliases, and values overrides.
     If a missing library supplies a required helper, even the reduced render fails.
+    Without allow_downloads the retry renders only what is bundled and never contacts a repository.
     """
     error = _dependency_error(diagnostic)
     if not error:
@@ -102,7 +105,7 @@ def render_available_dependencies(
             shutil.copytree(root, stage, symlinks=True, ignore=shutil.ignore_patterns('.git'))
             if any(path.is_symlink() for path in stage.rglob('*')):
                 return None
-            if blocked_repos(str(stage)):
+            if allow_downloads and blocked_repos(str(stage)):
                 return None
             metadata_path = stage / 'Chart.yaml'
             metadata = yaml.safe_load(metadata_path.read_bytes())
@@ -147,7 +150,8 @@ def render_available_dependencies(
                 return None
 
             failed = _named_failures(error, missing, deps, root)
-            if failed and failed < missing and _can_update([dep for dep in deps if dep['name'] not in failed], lock, stage):
+            if (allow_downloads and failed and failed < missing
+                    and _can_update([dep for dep in deps if dep['name'] not in failed], lock, stage)):
                 # Helm's first update can fail atomically even after fetching some
                 # archives. Try the remaining declared remotes together just once.
                 # Keep the offline input untouched: an unsuccessful update may

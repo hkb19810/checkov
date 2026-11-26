@@ -242,8 +242,9 @@ class TestRunnerValid(unittest.TestCase):
 class TestHelmDependencyRemoteRepos(unittest.TestCase):
     """Tests for helm remote dependency repository allowlist.
 
-    Default behaviour: helm template --dependency-update runs normally (original behaviour preserved).
-    Blocking is opt-in via CHECKOV_HELM_ALLOWED_REMOTE_REPOS — an allowlist of trusted repo URL prefixes.
+    Default behaviour: helm template renders only what is bundled, without --dependency-update.
+    Downloads are opt-in via CHECKOV_HELM_DEPENDENCY_UPDATE=true. Then blocking is opt-in via
+    CHECKOV_HELM_ALLOWED_REMOTE_REPOS — an allowlist of trusted repo URL prefixes.
     Dependency repos NOT in the allowlist cause the build to be skipped.
     """
 
@@ -264,6 +265,19 @@ class TestHelmDependencyRemoteRepos(unittest.TestCase):
     def test_get_chart_remote_repos_returns_empty_for_missing_dir(self):
         """_get_chart_remote_repos() must not raise for a missing directory."""
         self.assertEqual(_get_chart_remote_repos("/nonexistent/path"), [])
+
+    def test_get_chart_remote_repos_detects_oci_and_requirements_yaml(self):
+        with tempfile.TemporaryDirectory() as chart_dir:
+            Path(chart_dir, "Chart.yaml").write_text(
+                "apiVersion: v2\nname: app\nversion: 1.0.0\ndependencies:\n"
+                "- name: private\n  version: 1.0.0\n  repository: oci://registry.example.com/charts\n"
+                "- name: local\n  version: 1.0.0\n  repository: file://../local\n"
+            )
+            Path(chart_dir, "requirements.yaml").write_text(
+                "dependencies:\n- name: legacy\n  version: 1.0.0\n  repository: https://charts.example.com\n"
+            )
+            repos = _get_chart_remote_repos(chart_dir)
+        self.assertEqual(repos, ["oci://registry.example.com/charts", "https://charts.example.com"])
 
     # ------------------------------------------------------------------
     # _get_blocked_helm_repos() unit tests (allowlist logic)
@@ -374,7 +388,16 @@ class TestHelmDependencyRemoteRepos(unittest.TestCase):
     # get_binary_output() integration tests
     # ------------------------------------------------------------------
 
-    @mock.patch.dict(os.environ, {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": ""})
+    @mock.patch.dict(os.environ, {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": "none", "CHECKOV_HELM_DEPENDENCY_UPDATE": ""})
+    def test_renders_bundled_dependencies_without_update_or_allowlist_by_default(self):
+        output = b"---\n# Source: example/templates/pod.yaml\nkind: Pod\n"
+        with mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, output, b"")) as run:
+            result, _ = Runner.get_binary_output(self._make_chart_item(), "./tmp", "helm", RunnerFilter())
+
+        self.assertEqual(result, output)
+        self.assertEqual(run.call_args.args[0], ["helm", "template", self._REMOTE_DEP_DIR])
+
+    @mock.patch.dict(os.environ, {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": "", "CHECKOV_HELM_DEPENDENCY_UPDATE": "true"})
     def test_successful_stdout_is_used_even_with_oci_progress_on_stderr(self):
         chart_item = self._make_chart_item()
         output = b"---\n# Source: example/templates/pod.yaml\nkind: Pod\n"
@@ -394,7 +417,8 @@ class TestHelmDependencyRemoteRepos(unittest.TestCase):
 
         self.assertIsNone(result)
 
-    @mock.patch.dict(os.environ, {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": "https://charts.trusted.org/"})
+    @mock.patch.dict(os.environ, {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": "https://charts.trusted.org/",
+                                  "CHECKOV_HELM_DEPENDENCY_UPDATE": "true"})
     def test_build_skipped_when_repo_not_in_allowlist(self):
         with mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as run:
             result, _ = Runner.get_binary_output(self._make_chart_item(), "./tmp", "helm", RunnerFilter())
@@ -402,12 +426,26 @@ class TestHelmDependencyRemoteRepos(unittest.TestCase):
         self.assertIsNone(result)
         self.assertFalse(any(call.args[0][1] == "template" for call in run.call_args_list))
 
-    @mock.patch.dict(os.environ, {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": "http://192.0.2.1"})
+    @mock.patch.dict(os.environ, {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": "http://192.0.2.1",
+                                  "CHECKOV_HELM_DEPENDENCY_UPDATE": "true"})
     def test_build_proceeds_when_all_repos_in_allowlist(self):
         output = b"apiVersion: v1\nkind: ConfigMap\n"
         with mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, output, b"")):
             result, _ = Runner.get_binary_output(self._make_chart_item(), "./tmp", "helm", RunnerFilter())
         self.assertEqual(result, output)
+
+    @mock.patch.dict(os.environ, {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": "none", "CHECKOV_HELM_DEPENDENCY_UPDATE": "true"})
+    def test_oci_dependency_blocked_when_downloads_enabled(self):
+        with tempfile.TemporaryDirectory() as chart_dir:
+            Path(chart_dir, "Chart.yaml").write_text(
+                "apiVersion: v2\nname: app\nversion: 1.0.0\ndependencies:\n"
+                "- name: private\n  version: 1.0.0\n  repository: oci://registry.example.com/charts\n"
+            )
+            with mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as run:
+                result, _ = Runner.get_binary_output((chart_dir, {"name": "app"}), "./tmp", "helm", RunnerFilter())
+
+        self.assertIsNone(result)
+        self.assertFalse(any(call.args[0][1] == "template" for call in run.call_args_list))
 
 
 @unittest.skipIf(not helm_exists(), "helm not installed")
@@ -443,7 +481,7 @@ class TestIncompleteHelmChart(unittest.TestCase):
         self.assertGreater(report["summary"]["parsing_errors"], 0)
         self.assertIn("Chart.yaml", report["results"]["parsing_errors"][0])
 
-    @mock.patch.dict(os.environ, {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": "none"})
+    @mock.patch.dict(os.environ, {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": "none", "CHECKOV_HELM_DEPENDENCY_UPDATE": "true"})
     def test_blocked_dependency_is_reported_without_rendering_or_partial_recovery(self):
         metadata = self.chart_yaml.read_text().replace("file://../unavailable", "https://charts.example.com")
         self.chart_yaml.write_text(metadata)
@@ -481,7 +519,7 @@ class TestIncompleteHelmChart(unittest.TestCase):
         self.assertTrue(any("partial" in detail and "unavailable" in detail for detail in findings[0].details))
         self.assertEqual(self.chart_yaml.read_text(), chart_yaml)
 
-    def test_retry_builds_missing_but_resolvable_sibling(self):
+    def _add_unbundled_file_dependency(self) -> None:
         # Keep the dependency source outside Checkov's chart discovery so its
         # finding can only come from rendering it in the parent release.
         available = self.parent / ".sources" / "available"
@@ -498,6 +536,10 @@ class TestIncompleteHelmChart(unittest.TestCase):
             )
         self.assertFalse((self.parent / "charts").exists())
 
+    @mock.patch.dict(os.environ, {"CHECKOV_HELM_DEPENDENCY_UPDATE": "true"})
+    def test_retry_builds_missing_but_resolvable_sibling(self):
+        self._add_unbundled_file_dependency()
+
         report = Runner().run(str(self.parent), runner_filter=RunnerFilter(framework=["helm"], checks=["CKV_K8S_14"]))
 
         self.assertEqual(len(report.parsing_errors), 1)
@@ -506,6 +548,121 @@ class TestIncompleteHelmChart(unittest.TestCase):
                               ["Pod.default.parent", "Pod.default.available"])
         for record in report.failed_checks:
             self.assertTrue(any("partial" in detail and "unavailable" in detail for detail in record.details))
+
+    @mock.patch.dict(os.environ, {"CHECKOV_HELM_DEPENDENCY_UPDATE": ""})
+    def test_unbundled_dependencies_are_omitted_when_downloads_are_off(self):
+        self._add_unbundled_file_dependency()
+
+        report = Runner().run(str(self.parent), runner_filter=RunnerFilter(framework=["helm"], checks=["CKV_K8S_14"]))
+
+        self.assertEqual(len(report.parsing_errors), 1)
+        self.assertIn("omitted dependencies: available, unavailable", report.parsing_errors[0])
+        self.assertEqual([record.resource for record in report.failed_checks], ["Pod.default.parent"])
+        self.assertFalse((self.parent / "charts").exists())
+
+
+@unittest.skipIf(not helm_exists(), "helm not installed")
+@mock.patch.dict(os.environ, {"CHECKOV_HELM_ALLOWED_REMOTE_REPOS": "none", "CHECKOV_HELM_DEPENDENCY_UPDATE": ""})
+class TestBundledHelmDependencies(unittest.TestCase):
+    """Charts render offline from their bundled dependencies, whatever repository the declarations name."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.sources = self.root / ".sources"
+
+    def _chart(self, directory: Path, name: str, dependencies: tuple[tuple[str, str], ...] = (),
+               api_version: str = "v2") -> Path:
+        (directory / "templates").mkdir(parents=True)
+        declarations = "".join(f"- name: {dep}\n  version: 1.0.0\n  repository: {repo}\n" for dep, repo in dependencies)
+        metadata = f"apiVersion: {api_version}\nname: {name}\nversion: 1.0.0\n"
+        if declarations and api_version == "v1":
+            (directory / "requirements.yaml").write_text("dependencies:\n" + declarations)
+        elif declarations:
+            metadata += "dependencies:\n" + declarations
+        (directory / "Chart.yaml").write_text(metadata)
+        (directory / "templates" / "pod.yaml").write_text(
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: {{ .Chart.Name }}\n"
+            "spec:\n  containers:\n    - name: app\n      image: example:latest\n"
+        )
+        return directory
+
+    def _bundle(self, chart: Path, into: Path) -> None:
+        (into / "charts").mkdir(exist_ok=True)
+        subprocess.run(["helm", "package", str(chart), "--destination", str(into / "charts")],
+                       check=True, capture_output=True, timeout=30)
+
+    def _scan(self, chart: Path) -> Report:
+        return Runner().run(str(chart), runner_filter=RunnerFilter(framework=["helm"], checks=["CKV_K8S_14"]))
+
+    def test_bundled_public_and_private_dependencies_are_scanned_without_a_registry(self):
+        parent = self._chart(self.root / "app", "app", (("public", "https://charts.example.com"),
+                                                        ("private", "oci://registry.example.com/charts")))
+        self._bundle(self._chart(self.sources / "public", "public"), parent)
+        self._bundle(self._chart(self.sources / "private", "private"), parent)
+
+        report = self._scan(parent)
+
+        self.assertEqual(report.parsing_errors, [])
+        self.assertCountEqual([record.resource for record in report.failed_checks],
+                              ["Pod.default.app", "Pod.default.public", "Pod.default.private"])
+
+    def test_missing_private_dependency_is_reported_and_bundled_public_is_scanned(self):
+        parent = self._chart(self.root / "app", "app", (("public", "https://charts.example.com"),
+                                                        ("private", "oci://registry.example.com/charts")))
+        self._bundle(self._chart(self.sources / "public", "public"), parent)
+
+        report = self._scan(parent)
+
+        self.assertEqual(len(report.parsing_errors), 1)
+        self.assertIn("omitted dependencies: private", report.parsing_errors[0])
+        self.assertCountEqual([record.resource for record in report.failed_checks],
+                              ["Pod.default.app", "Pod.default.public"])
+
+    def test_v1_chart_uses_bundled_requirements_dependency(self):
+        parent = self._chart(self.root / "legacy", "legacy", (("public", "https://charts.example.com"),), api_version="v1")
+        self._bundle(self._chart(self.sources / "public", "public"), parent)
+
+        report = self._scan(parent)
+
+        self.assertEqual(report.parsing_errors, [])
+        self.assertCountEqual([record.resource for record in report.failed_checks],
+                              ["Pod.default.legacy", "Pod.default.public"])
+
+    def test_library_chart_is_rendered_only_through_the_chart_that_uses_it(self):
+        common = self.root / "charts" / "common"
+        (common / "templates").mkdir(parents=True)
+        (common / "Chart.yaml").write_text("apiVersion: v2\nname: common\nversion: 1.0.0\ntype: library\n")
+        (common / "templates" / "_helpers.tpl").write_text('{{- define "common.image" -}}example:latest{{- end -}}\n')
+        app = self.root / "charts" / "app"
+        (app / "templates").mkdir(parents=True)
+        (app / "Chart.yaml").write_text(
+            "apiVersion: v2\nname: app\nversion: 1.0.0\ndependencies:\n"
+            "- name: common\n  version: 1.0.0\n  repository: file://../common\n"
+        )
+        (app / "templates" / "pod.yaml").write_text(
+            "apiVersion: v1\nkind: Pod\nmetadata:\n  name: app\n"
+            "spec:\n  containers:\n    - name: app\n      image: {{ include \"common.image\" . }}\n"
+        )
+        self._bundle(common, app)
+
+        report = self._scan(self.root)
+
+        self.assertEqual(report.parsing_errors, [])
+        self.assertEqual([record.resource for record in report.failed_checks], ["Pod.default.app"])
+
+    def test_nested_bundled_dependency_is_scanned(self):
+        child = self._chart(self.sources / "child", "child", (("grandchild", "oci://registry.example.com/charts"),))
+        self._bundle(self._chart(self.sources / "grandchild", "grandchild"), child)
+        parent = self._chart(self.root / "app", "app", (("child", "https://charts.example.com"),))
+        self._bundle(child, parent)
+
+        report = self._scan(parent)
+
+        self.assertEqual(report.parsing_errors, [])
+        self.assertCountEqual([record.resource for record in report.failed_checks],
+                              ["Pod.default.app", "Pod.default.child", "Pod.default.grandchild"])
 
 
 class TestRenderedSourcePaths(unittest.TestCase):

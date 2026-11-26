@@ -175,7 +175,7 @@ class Runner(ImageReferencerMixin[None], BaseRunner[_KubernetesDefinitions, _Kub
                     continue
 
                 skipped_checks = get_skipped_checks(entity_conf)
-                results = registry.scan(k8_file, entity_conf, skipped_checks, runner_filter)
+                results = registry.scan(k8_file, entity_conf, skipped_checks, runner_filter, report_type=self.report_type)
 
                 # TODO? - Variable Eval Message!
                 variable_evaluations: "dict[str, Any]" = {}

@@ -114,7 +114,7 @@ Since helm manages our namespaces, we always skip this internally when using the
 
 Checkov uses Helm's exit code to decide whether rendering succeeded. When Helm returns success, Checkov scans the manifests even if Helm wrote warnings or registry download progress to stderr.
 
-If Helm cannot resolve a direct dependency of a v2 chart, Checkov can render the parent and available subcharts in a temporary copy. The retry retains the original values files and their order. If Helm identifies the failed dependency and the remaining declarations can be resolved safely, Checkov also attempts to download the remaining dependencies. If the reduced chart still needs a missing helper or cannot be rendered, Checkov reports the chart error and continues with other charts.
+If Helm cannot resolve a direct dependency of a v2 chart, Checkov can render the parent and available subcharts in a temporary copy. The retry retains the original values files and their order. When dependency downloads are enabled, Helm identifies the failed dependency, and the remaining declarations can be resolved safely, Checkov also attempts to download the remaining dependencies. If the reduced chart still needs a missing helper or cannot be rendered, Checkov reports the chart error and continues with other charts.
 
 Findings from a partial render carry a note in `details` naming the omitted dependencies. The Helm report includes the chart in `results.parsing_errors`, including in quiet JSON output. These findings describe the resources produced by the reduced chart. Missing subcharts can affect values, templates and policies that check relationships between resources.
 
@@ -122,19 +122,21 @@ An incomplete Helm scan exits with code 1 by default, even when there are zero p
 
 ## Dependency Repository Security
 
-By default, Checkov runs `helm template --dependency-update` normally — all remote dependency repositories in `Chart.yaml` are allowed (original behaviour preserved).
+By default, Checkov runs `helm template` without `--dependency-update`, so Helm never downloads a dependency. Charts render from what the scanned directory holds: a dependency bundled under `charts/` (a packaged `.tgz` or an unpacked chart) is used whatever repository its declaration in `Chart.yaml` or `requirements.yaml` names, including HTTPS, OCI and private registries. A dependency that is not bundled is reported, and the chart is scanned as a partial render (see [Incomplete charts](#incomplete-charts)). Bundled subcharts bring their own bundled dependencies, so nested dependencies follow the same rule. `file://` dependencies are not packaged from their source folder in this mode; bundle them, or enable downloads.
 
-To restrict direct HTTP(S) repositories, set `CHECKOV_HELM_ALLOWED_REMOTE_REPOS` to a comma-separated list of trusted URL prefixes in CI. If a declared HTTP(S) repository does not match, Checkov skips that chart and reports a parsing error, including when the dependency is bundled. OCI references are outside this allowlist.
+To let Helm download missing dependencies, set `CHECKOV_HELM_DEPENDENCY_UPDATE=true`. Checkov then runs `helm template --dependency-update`, which writes the downloaded charts into the chart's `charts/` folder. Private repositories need Helm's own registry login or repository configuration.
+
+When downloads are enabled, `CHECKOV_HELM_ALLOWED_REMOTE_REPOS` restricts them to a comma-separated list of trusted URL prefixes, set in CI. It covers HTTPS and OCI repositories declared in `Chart.yaml` or `requirements.yaml`. If a declared repository does not match, Checkov skips that chart and reports a parsing error. Without downloads the allowlist is not consulted, because nothing is downloaded.
 
 ### Usage (set as a CI environment variable, not in scanned files)
 
 ```bash
-# Restrict declared HTTP(S) repositories to these prefixes:
-CHECKOV_HELM_ALLOWED_REMOTE_REPOS=https://charts.myorg/,https://charts.partner.com/ \
-  checkov -d ./myapp --framework helm
+# Default: render bundled dependencies only, never download:
+checkov -d ./myapp --framework helm
 
-# Block all declared HTTP(S) repositories:
-CHECKOV_HELM_ALLOWED_REMOTE_REPOS=none \
+# Download missing dependencies, only from these prefixes:
+CHECKOV_HELM_DEPENDENCY_UPDATE=true \
+CHECKOV_HELM_ALLOWED_REMOTE_REPOS=https://charts.myorg/,oci://registry.myorg/charts \
   checkov -d ./myapp --framework helm
 ```
 

@@ -34,40 +34,50 @@ if TYPE_CHECKING:
     from networkx import DiGraph
 
 
-# Regex matching remote helm repository URLs (http/https).
-# OCI registries are not covered by this HTTP(S) repository allowlist.
-_HELM_REMOTE_REPO = re.compile(r'^https?://', re.IGNORECASE)
+# Remote dependency repositories: HTTP(S) chart repositories and OCI registries.
+_HELM_REMOTE_REPO = re.compile(r'^(https?|oci)://', re.IGNORECASE)
+
+# Helm reads the dependencies of apiVersion v1 charts from requirements.yaml.
+_DEPENDENCY_FILES = ('Chart.yaml', 'requirements.yaml')
+
+
+def _dependency_downloads_enabled() -> bool:
+    """Helm only downloads missing dependencies when CHECKOV_HELM_DEPENDENCY_UPDATE is 'true'.
+
+    Otherwise charts render from what is in the scanned directory: dependencies bundled
+    under charts/ are used, and missing ones are reported.
+    """
+    return os.getenv("CHECKOV_HELM_DEPENDENCY_UPDATE", "").strip().lower() == "true"
 
 
 def _get_chart_remote_repos(chart_dir: str) -> list[str]:
-    """Return all remote repository URLs from Chart.yaml dependencies.
+    """Return all remote repository URLs from Chart.yaml and requirements.yaml dependencies.
 
-    Returns an empty list when the file cannot be read or has no remote repos.
+    Returns an empty list when the files cannot be read or have no remote repos.
     """
-    chart_yaml_path = os.path.join(chart_dir, 'Chart.yaml')
-    if not os.path.isfile(chart_yaml_path):
-        return []
-    try:
-        with open(chart_yaml_path, 'r', encoding='utf-8') as f:
-            doc = yaml.safe_load(f)
-    except Exception:
-        logging.debug(f"Could not parse {chart_yaml_path} for remote repo check.", exc_info=True)
-        return []
-
-    if not isinstance(doc, dict):
-        return []
-
     remote_repos: list[str] = []
-    for dep in doc.get('dependencies') or []:
-        if not isinstance(dep, dict):
+    for file_name in _DEPENDENCY_FILES:
+        path = os.path.join(chart_dir, file_name)
+        if not os.path.isfile(path):
             continue
-        repo = dep.get('repository', '')
-        if isinstance(repo, str) and _HELM_REMOTE_REPO.match(repo):
-            remote_repos.append(repo)
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                doc = yaml.safe_load(f)
+        except Exception:
+            logging.debug(f"Could not parse {path} for remote repo check.", exc_info=True)
+            continue
+        if not isinstance(doc, dict):
+            continue
+        for dep in doc.get('dependencies') or []:
+            if not isinstance(dep, dict):
+                continue
+            repo = dep.get('repository', '')
+            if isinstance(repo, str) and _HELM_REMOTE_REPO.match(repo):
+                remote_repos.append(repo)
     return remote_repos
 
 
-_DEFAULT_PORTS = {"http": 80, "https": 443}
+_DEFAULT_PORTS = {"http": 80, "https": 443, "oci": 443}
 
 
 def _repo_matches_prefix(repo: str, prefix: str) -> bool:
@@ -96,8 +106,9 @@ def _repo_matches_prefix(repo: str, prefix: str) -> bool:
 def _get_blocked_helm_repos(chart_dir: str) -> list[str]:
     """Return dependency repos blocked by the CHECKOV_HELM_ALLOWED_REMOTE_REPOS allowlist.
 
-    Not set → [] (allow all). Set → returns repos not matching any allowed prefix (these are blocked).
-    To block all direct HTTP(S) repositories, use a non-matching value (e.g. 'none').
+    Applies only when dependency downloads are enabled. Not set → [] (allow all).
+    Set → returns repos not matching any allowed prefix (these are blocked).
+    To block all HTTP(S) and OCI repositories, use a non-matching value (e.g. 'none').
     """
     allowed_prefixes_raw = os.getenv("CHECKOV_HELM_ALLOWED_REMOTE_REPOS", "")
     if not allowed_prefixes_raw.strip():
@@ -135,7 +146,7 @@ class K8sHelmRunner(k8_runner):
         graph_manager: KubernetesGraphManager | None = None,
         external_registries: list[BaseRegistry] | None = None
     ) -> None:
-        super().__init__(graph_class, db_connector, source, graph_manager, external_registries)
+        super().__init__(graph_class, db_connector, source, graph_manager, external_registries, CheckType.HELM)
         self.chart_dir_and_meta: list[tuple[str, dict[str, Any]]] = []
         self.pbar.turn_off_progress_bar()
         self.partial_files: dict[str, str] = {}
@@ -402,11 +413,13 @@ class Runner(BaseRunner[_KubernetesDefinitions, _KubernetesContext, "KubernetesG
             if deps.stderr:
                 logging.warning("Helm dependency list for %s: %s", chart_dir, deps.stderr.decode(errors='replace').strip())
 
-            blocked_repos = _get_blocked_helm_repos(chart_dir)
-            if blocked_repos:
-                raise HelmRenderError(f"{len(blocked_repos)} dependency repo(s) not in CHECKOV_HELM_ALLOWED_REMOTE_REPOS allowlist")
+            downloads = _dependency_downloads_enabled()
+            if downloads:
+                blocked_repos = _get_blocked_helm_repos(chart_dir)
+                if blocked_repos:
+                    raise HelmRenderError(f"{len(blocked_repos)} dependency repo(s) not in CHECKOV_HELM_ALLOWED_REMOTE_REPOS allowlist")
 
-            args = [helm_command, 'template', '--dependency-update', chart_dir]
+            args = [helm_command, 'template', *(['--dependency-update'] if downloads else []), chart_dir]
             for var_file in runner_filter.var_files or []:
                 args.extend(['--values', var_file])
             result = subprocess.run(args, capture_output=True, timeout=timeout, check=False)  # nosec
@@ -449,7 +462,7 @@ class Runner(BaseRunner[_KubernetesDefinitions, _KubernetesContext, "KubernetesG
             if exc.diagnostic:
                 recovered = render_available_dependencies(
                     chart_dir, helm_command, runner_filter.var_files or [], 3600, exc.diagnostic,
-                    blocked_repos=_get_blocked_helm_repos,
+                    blocked_repos=_get_blocked_helm_repos, allow_downloads=_dependency_downloads_enabled(),
                 )
             if recovered is None:
                 logging.warning("Incomplete Helm scan for %s", result.error)
@@ -485,7 +498,9 @@ class Runner(BaseRunner[_KubernetesDefinitions, _KubernetesContext, "KubernetesG
         self.partial_files = {}
         chart_dirs = find_chart_directories(root_folder, files, runner_filter.excluded_paths)
         metadata = parallel_runner.run_function(func=Runner.parse_helm_chart_details, items=chart_dirs)
-        chart_dir_and_meta = [(directory, meta or {}) for directory, meta in metadata]
+        # Helm refuses to render a library chart on its own; the charts that use it render it.
+        chart_dir_and_meta = [(directory, meta or {}) for directory, meta in metadata
+                              if not (isinstance(meta, dict) and meta.get('type') == 'library')]
         chart_items = [(item, self.root_folder, self.target_folder_path, self.helm_command, runner_filter)
                        for item in chart_dir_and_meta]
         for conversion in parallel_runner.run_function(func=Runner._convert_chart_to_k8s, items=chart_items):
